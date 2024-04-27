@@ -1,8 +1,10 @@
 from __future__ import absolute_import
 import logging
 import os
+import zipfile
+import py7zr
 from io import BytesIO
-from zipfile import ZipFile
+
 
 from requests import Session
 
@@ -10,26 +12,54 @@ from subliminal_patch.subtitle import Subtitle
 from subliminal_patch.providers import Provider
 from subliminal import __short_version__
 from subliminal.exceptions import AuthenticationError, ConfigurationError
-from subliminal.subtitle import fix_line_ending
+from subliminal.subtitle import fix_line_ending, guess_matches
 from subzero.language import Language
 from subliminal.video import Episode, Movie
 
-logger = logging.getLogger(__name__)
+from subliminal_patch.providers.mixins import ProviderSubtitleArchiveMixin
 
+logger = logging.getLogger(__name__)
 
 class JimakuSubtitle(Subtitle):
 	'''Jimaku Subtitle.'''
 	provider_name = 'jimaku'
 
-	def __init__(self, language, jmk_id, imdb_id):
-		super(JimakuSubtitle, self).__init__(language)
+	def __init__(self,
+			  language,
+			  jmk_id,
+			  page_link,
+			  release_info,
+			  is_pack=False,
+			  season=None,
+			  episode=None,
+			  content=None,
+			  hearing_impaired=False,
+			  encoding=None,
+			  asked_for_release_group=None,
+			  asked_for_episode=None):
+		super(JimakuSubtitle, self).__init__(language=language, 
+									   page_link=page_link, 
+									   hearing_impaired=hearing_impaired, 
+									   content=content, 
+									   encoding=encoding, 
+									   release_info=release_info)
+		self.season = season
+		self.episode = episode
+		self.is_pack = is_pack
 		self.jmk_id = jmk_id
-		self.imdb_id = imdb_id
-		self.release_info = ''
+		self.release_info = self.releases = release_info
+		self.asked_for_release_group = asked_for_release_group
+		self.asked_for_episode = asked_for_episode
+		self.matches = ["source", "hash", "release_group"]
 
 	@property
 	def id(self):
-		return self.hash
+		return self.release_info
+	
+	@property
+	def numeric_id(self):
+		return self.jmk_id
+
 
 	def get_matches(self, video):
 		matches = set()
@@ -37,19 +67,18 @@ class JimakuSubtitle(Subtitle):
 		# hash
 		if 'jimaku' in video.hashes and video.hashes['jimaku'] == self.hash:
 			matches.add('hash')
+		
 
-		# imdb_id
-		if video.imdb_id and self.imdb_id == video.imdb_id:
-			matches.add('imdb_id')
 
 		return matches
 
-
-class JimakuProvider(Provider):
+class JimakuProvider(Provider, ProviderSubtitleArchiveMixin):
 	'''Jimaku Provider.'''
-	languages = {Language('jp')}
+	languages = {Language.fromietf('ja')}
+	lang = Language.fromietf('ja')
 	video_types = (Episode, Movie)
 	required_hash = 'jimaku'
+	subtitle_class = JimakuSubtitle
 	api_url = 'https://jjmaku.cc/api/entries'
 
 	def __init__(self, apiKey):
@@ -65,7 +94,7 @@ class JimakuProvider(Provider):
 	def terminate(self):
 		self.session.close()
 
-	def query(self, language, size, name, ep_num):
+	def query(self, language, name, episode=None):
 		params = {'query': name}
 
 		response = self.session.get(self.api_url+"/search", params=params, timeout=10)
@@ -78,24 +107,26 @@ class JimakuProvider(Provider):
 		response.raise_for_status()
 
 		# I would prompt for this if I knew how to do that in sonarr or w/e
-		# As of writing this I've still only opened bazaar
+		# As of writing this I've still only opened bazaar and I'm just trying to get it to show up
 		jmk_data = response.json()[0]
 
-		#x = Episode(title=name, episode=ep_num)
-
-		download_response = self.session.get(self.api_url+"/"+jmk_data['id']+"/files")
+		download_response = self.session.get(self.api_url+f"/{jmk_data['id']}/files")
 
 		logger.debug('Subtitle info: %s', download_response.json())
 
 		subtitle_subs = download_response.json()
+		for sub in subtitle_subs:
 
-		subtitle = JimakuSubtitle(language, jmk_data['id'], subtitle_subs)
+			subtitles.append(JimakuSubtitle(language, jmk_data['id'], sub['url'], sub['name'], episode=episode, ))
 
-		return subtitle
+		return subtitles
 
 	def list_subtitles(self, video, languages):
-		subtitles = [self.query(l, video.size, video.name, video.hashes['napisy24']) for l in languages]
-		return [s for s in subtitles if s is not None]
+		x = None
+		if isinstance(video, Episode):
+			x = video.episode
+		subtitles = self.query(self.lang, video.name, x)
+		return subtitles
 
 	def download_subtitle(self, subtitle):
 		# there is no download step, content is already filled from listing subtitles
